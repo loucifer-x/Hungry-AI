@@ -6,8 +6,7 @@
 
 
 ## Usage 
-
-# Main.py
+**Main.py**
 - /help
 - /info
 - /clear
@@ -16,9 +15,7 @@
 - /status
 - /exit
 
-
-
-# Ingest.py
+**Ingest.py**
 - --cocurrency [number] parallel requests (default 8)
 - --delay [number] seconds between requests (default 0.5)
 - --crawl crawls the web page for more links (1 by default)
