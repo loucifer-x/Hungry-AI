@@ -40,6 +40,116 @@ The more you feed Hungry AI, the more personalized and useful it becomes.
 
 ---
 
+## Configuration Overview
+
+Hungry AI includes a few core settings that control how the system behaves. These settings are important because they define how the AI responds, what it retrieves, and how it organizes information.
+
+You are expected to customize these settings to fit your own use case, data, and workflow.
+
+---
+
+## SYSTEM_PROMPT
+
+This defines the base behavior of the AI.
+
+It controls:
+
+* How the AI responds to commands
+* Whether it explains or stays minimal
+* Output rules and restrictions
+
+Example:
+
+```python
+SYSTEM_PROMPT = """
+The assistant is hungry, created by https://github.com/louuuuuu
+...
+"""
+```
+
+If you change this, you change the personality and strictness of the AI.
+
+---
+
+## RAG_MIN_LENGTH
+
+This setting controls when retrieval (RAG) is triggered.
+
+* Short queries below this length will NOT search the database
+* Helps avoid unnecessary searches for simple inputs
+
+Example:
+
+```python
+RAG_MIN_LENGTH = 10
+```
+
+Lower value = more retrieval
+Higher value = less retrieval
+
+---
+
+## RAG_SKIP_PHRASES
+
+This is a list of common phrases that skip retrieval completely.
+
+It includes things like:
+
+* greetings (hello, hi)
+* small talk (how are you)
+* simple responses (thanks, bye)
+
+Example:
+
+```python
+RAG_SKIP_PHRASES = {"hi", "hello", "thanks", "bye"}
+```
+
+You should edit this list based on how your AI is used.
+
+---
+
+## RULES (Category System)
+
+This defines how incoming data is categorized.
+
+Each rule looks like:
+
+```python
+("category", "subcategory", priority, ["keywords"])
+```
+
+Example:
+
+```python
+("linux", "commands", 10, ["ls", "cd", "cp"])
+```
+
+It helps the system:
+
+* Organize knowledge
+* Improve search accuracy
+* Group related information
+
+You should customize this based on your own data sources and domains.
+
+---
+
+## Why Customization Matters
+
+Hungry AI is not a plug-and-play assistant.
+
+It becomes useful only when you:
+
+* Tune the system prompt for behavior
+* Adjust retrieval sensitivity
+* Define your own categories and keywords
+* Add your own skip rules
+
+The more you customize it, the more it behaves like *your* personal AI system instead of a generic model.
+
+---
+
 ## Setup
 
 ### Install Dependencies
@@ -187,6 +297,10 @@ Most AI assistants start every conversation with the same generic knowledge.
 Hungry AI is different.
 
 By continuously ingesting and retrieving information from your documents, websites, codebases, notes, and research, it develops a knowledge base unique to you. The result is an AI assistant that understands your work, remembers what matters, and provides answers grounded in your own data.
+
+
+
+
 
 **Feed it data. It remembers.**
 
