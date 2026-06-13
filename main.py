@@ -3,6 +3,8 @@ main.py — Streaming CLI chat interface for the local AI assistant.
 Everything is lazy: DB connection and embedder only load on first query.
 """
 
+
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -35,10 +37,21 @@ from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+import requests
 
 import config
 from config import configure_logging
 from rag import get_chroma_collection, retrieve_context, format_context_block, get_db_count
+########################
+#hacker 
+
+from hack import connection
+
+
+
+########################
+
+
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -50,6 +63,31 @@ Message = dict[str, str]
 # ──────────────────────────────────────────────
 # MEMORY
 # ──────────────────────────────────────────────
+
+import importlib.util
+import inspect
+
+def load_addons(folder="addon"):
+    functions = {}
+
+    for root, _, files in os.walk(folder):
+        for file in files:
+            if not file.endswith(".py"):
+                continue
+
+            path = os.path.join(root, file)
+            module_name = path.replace(os.sep, ".").removesuffix(".py")
+
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            for name, obj in inspect.getmembers(module, inspect.isfunction):
+                functions[name] = obj
+                print(f"Loaded: {name}() from {path}")
+
+    return functions
+addons = load_addons("addons")
 
 class ConversationMemory:
     def __init__(self, max_pairs: int = config.MAX_HISTORY_PAIRS) -> None:
@@ -132,6 +170,16 @@ def handle_command(
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
+    if cmd == "/codddnnect":
+        args = parts[1].split()
+        if len(args) < 2:
+            print("Usage: /connect <ip> <port>")
+        else:
+            ip = args[0]
+            port = int(args[1])
+        connection(ip, port)
+
+
     if cmd == "/help":
         table = Table(title="Available Commands", show_header=True, header_style="bold red")
         table.add_column("Command", style="red")
@@ -209,6 +257,20 @@ def handle_command(
     elif cmd in ("/exit", "/quit", "/bye"):
         console.print("\n[bold green]Goodbye! 👋[/]")
         return False
+    
+    elif cmd.startswith("/"):
+        
+        finalcmd = cmd.replace("/","")
+        argsplit = parts[1].split() if len(parts) > 1 else []
+        if finalcmd in addons:
+            try:
+                addons[finalcmd](*argsplit)
+            except TypeError as e:
+                addons[finalcmd]
+                print(f"Argument error for '{finalcmd}': {e}    args:{argsplit}")
+        else:
+            console.print(f"[red]Unknown command '{cmd}'. Type /help for options.[/]")
+
 
     else:
         console.print(f"[red]Unknown command '{cmd}'. Type /help for options.[/]")
