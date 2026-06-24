@@ -147,7 +147,7 @@ TOOLS = [
 ]
 
 
-def run_search_tool(query: str) -> str:
+def run_search_tool(query: str, web_search: bool = False) -> str:
     """Execute the search_docs tool and return formatted results as a string."""
     if not isinstance(query, str):
         query = str(query)
@@ -159,6 +159,7 @@ def run_search_tool(query: str) -> str:
             query,
             top_k=config.TOP_K_RESULTS,
             min_score=config.MIN_RELEVANCE_SCORE,
+            web_fallback=web_search,
         )
         if not hits:
             return "No relevant information found in the knowledge base."
@@ -167,10 +168,16 @@ def run_search_tool(query: str) -> str:
         if not isinstance(result, str):
             result = str(result)
 
-        sources = {h["source"].split("/")[-1] for h in hits}
-        console.print(
-            f"[dim]📎 Retrieved {len(hits)} chunk(s) from: {', '.join(sources)}[/]"
-        )
+        db_hits  = [h for h in hits if not h.get("web_fallback")]
+        web_hits = [h for h in hits if h.get("web_fallback")]
+
+        if db_hits:
+            sources = {h["source"].split("/")[-1] for h in db_hits}
+            console.print(f"[red]📎 DATABASE CHUNK: {len(db_hits)} chunk(s) from: {', '.join(sources)}[/]")
+        if web_hits:
+            sources = {h["source"].split("/")[-1] for h in web_hits}
+            console.print(f"[red]📎 WEB CHUNK: {len(web_hits)} chunk(s) from: {', '.join(sources)}[/]")
+
         return result
     except Exception as exc:
         logger.error("Tool search failed: %s", exc)
@@ -185,6 +192,7 @@ async def stream_response_tool(
     client: AsyncClient,
     messages: list[Message],
     model: str,
+    web_search: bool = False,
 ) -> AsyncIterator[str]:
     """Tool-calling mode: model decides when to search."""
     response = await client.chat(
@@ -211,7 +219,7 @@ async def stream_response_tool(
 
             if fn_name == "search_docs":
                 query = fn_args.get("query", "") if isinstance(fn_args, dict) else str(fn_args)
-                tool_result = await asyncio.to_thread(run_search_tool, query)
+                tool_result = await asyncio.to_thread(run_search_tool, query, web_search)
             else:
                 tool_result = f"Unknown tool: {fn_name}"
 
@@ -243,6 +251,7 @@ async def stream_response_inject(
     messages: list[Message],
     model: str,
     raw_query: str,
+    web_search: bool = False,
 ) -> AsyncIterator[str]:
     """Inject mode: always retrieve and prepend context before sending."""
     rag_hits: list[dict] = []
@@ -252,12 +261,19 @@ async def stream_response_inject(
             raw_query,
             top_k=config.TOP_K_RESULTS,
             min_score=config.MIN_RELEVANCE_SCORE,
+            web_fallback=web_search,
         )
         if rag_hits:
-            sources = {h["source"].split("/")[-1] for h in rag_hits}
-            console.print(
-                f"[dim]📎 Retrieved {len(rag_hits)} chunk(s) from: {', '.join(sources)}[/]"
-            )
+            db_hits  = [h for h in rag_hits if not h.get("web_fallback")]
+            web_hits = [h for h in rag_hits if h.get("web_fallback")]
+
+            if db_hits:
+                sources = {h["source"].split("/")[-1] for h in db_hits}
+                console.print(f"[bold red]📎 DATABASE CHUNK:[/] [red]{len(db_hits)} chunk(s) from: {', '.join(sources)}[/]")
+            if web_hits:
+                sources = {h["source"].split("/")[-1] for h in web_hits}
+                console.print(f"[bold red]📎 WEB CHUNK:[/] [red]{len(web_hits)} chunk(s) from: {', '.join(sources)}[/]")
+
     except Exception as exc:
         logger.error("RAG retrieval failed: %s", exc)
 
@@ -334,6 +350,7 @@ COMMANDS = {
     "/status": "Show current config / model",
     "/info":   "System information",
     "/rag":    "Switch RAG mode  (/rag tool | /rag inject | /rag off)",
+    "/web":    "Toggle web search  (/web on | /web off)",
     "/exit":   "Quit the assistant",
 }
 
@@ -371,6 +388,18 @@ def handle_command(
         }
         console.print(f"[green]✓ RAG mode → [bold]{arg}[/] — {descriptions[arg]}[/]")
 
+    elif cmd == "/web":
+        if arg in ("on", "off"):
+            state["web_search"] = arg == "on"
+            status = "[green]enabled[/]" if state["web_search"] else "[red]disabled[/]"
+            console.print(f"[green]✓ Web search → {status}[/]")
+        else:
+            current = "on" if state["web_search"] else "off"
+            console.print(
+                f"[yellow]Web search is currently: [bold]{current}[/]\n"
+                f"Usage: /web on | /web off[/]"
+            )
+
     elif cmd == "/info":
         response = ollama.list()
         models = [m.get("model") for m in response.get("models", [])]
@@ -384,6 +413,7 @@ def handle_command(
         table.add_column("Value", style="red")
         table.add_row("Active model", state["model"])
         table.add_row("RAG mode", state["rag_mode"])
+        table.add_row("Web search", "on" if state["web_search"] else "off")
         table.add_row("Available models", ", ".join(models) if models else "None")
         table.add_row("Ollama host", config.OLLAMA_HOST)
         table.add_row("Conversation pairs", f"{memory.pair_count}/{memory.max_pairs}")
@@ -429,9 +459,10 @@ def handle_command(
     elif cmd == "/status":
         table = Table(title="Assistant Status", show_header=False)
         table.add_column("Key", style="bold")
-        table.add_column("Value", style="cyan")
+        table.add_column("Value", style="red")
         table.add_row("Model", state["model"])
         table.add_row("RAG mode", state["rag_mode"])
+        table.add_row("Web search", "on" if state["web_search"] else "off")
         table.add_row("Ollama host", config.OLLAMA_HOST)
         table.add_row("History pairs", f"{memory.pair_count} / {memory.max_pairs}")
         table.add_row("Top-K retrieval", str(config.TOP_K_RESULTS))
@@ -478,6 +509,7 @@ async def chat_loop() -> None:
     state = {
         "model": config.DEFAULT_MODEL,
         "rag_mode": RAG_MODE_INJECT,  # default mode
+        "web_search": False,          # web search disabled by default
     }
 
     # ── fetch DB stats for banner ──
@@ -504,15 +536,15 @@ async def chat_loop() -> None:
         db_section = "\n[dim]  DB unavailable[/]\n"
 
     console.print(Panel(
-
         "[dim]──────────────────────────────────────────────────────────────────────────────[/]\n"
         f"[bold red]  Model   [/][white]{state['model']}[/]\n"
         f"[bold red]  Host    [/][white]{config.OLLAMA_HOST}[/]\n"
         f"[bold red]  RAG     [/][white]{state['rag_mode']}[/]\n"
+        f"[bold red]  Web     [/][white]{'on' if state['web_search'] else 'off'}[/]\n"
         "[dim]──────────────────────────────────────────────────────────────────────────────[/]"
         + db_section +
         "[red]──────────────────────────────────────────────────────────────────────────────[/]\n"
-        "  [white]/help[/] [red]·[/] [white]/model[/] [red]·[/] [white]/list[/] [red]·[/] [white]/docs[/] [red]·[/] [white]/info[/] [red]·[/] [white]/clear[/] [red]·[/] [white]/rag[/] [red]·[/] [white]/exit[/]",
+        "  [white]/help[/] [red]·[/] [white]/model[/] [red]·[/] [white]/list[/] [red]·[/] [white]/docs[/] [red]·[/] [white]/info[/] [red]·[/] [white]/clear[/] [red]·[/] [white]/rag[/] [red]·[/] [white]/web[/] [red]·[/] [white]/exit[/]",
         border_style="bold red",
         padding=(1, 4),
         width=console.width,
@@ -546,19 +578,20 @@ async def chat_loop() -> None:
 
         full_response = ""
         mode = state["rag_mode"]
+        web_search = state["web_search"]
 
         try:
             with console.status("[red]thinking…[/]", spinner="dots", spinner_style="bold red"):
                 if mode == RAG_MODE_TOOL:
-                    gen = stream_response_tool(client, messages_to_send, state["model"])
+                    gen = stream_response_tool(client, messages_to_send, state["model"], web_search)
                 elif mode == RAG_MODE_INJECT:
-                    gen = stream_response_inject(client, messages_to_send, state["model"], raw)
+                    gen = stream_response_inject(client, messages_to_send, state["model"], raw, web_search)
                 else:  # off
                     gen = stream_response_off(client, messages_to_send, state["model"])
 
                 first = await gen.__anext__()
 
-            console.print(Text("Hungry:", style="bold red"))
+            console.print(Text("AI:", style="bold red"))
 
             with Live(
                 Markdown(first + "▋"),
