@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from typing import Optional, Tuple
 
 import config
@@ -52,22 +53,100 @@ def get_embedder():
 # CATEGORY SYSTEM
 # ─────────────────────────────────────────────
 
-#Structure [main catagory], [sub catagory], [linkable words]
-
 RULES = [
+    # ── Linux ─────────────────────────────────────────────────────────────────
     ("linux", "commands", 10, ["ls", "cd", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "cat", "echo"]),
+
+    ("other", "other", 0, []),
 ]
 
+# ─────────────────────────────────────────────
+# Precomputed lookup: keyword → (cat, sub, base_score)
+#
+# Keywords are split into two buckets:
+#   PHRASE keywords  — contain a space or are >5 chars (more specific, fewer
+#                      false-positives).  Matched as substrings, worth 2×.
+#   TOKEN keywords   — short, single words (≤5 chars).  Must match as whole
+#                      words (word-boundary check) to avoid "sh" hitting
+#                      "phishing", "cat" hitting "category", etc.  Worth 1×.
+#
+# Built once at import time.
+# ─────────────────────────────────────────────
+
+# Short tokens that are far too common in natural-language source names to be
+# reliable category signals on their own (e.g. "sh" inside "phishing").
+_AMBIGUOUS_TOKENS = {
+    "sh", "cat", "rm", "mv", "cp", "ls", "cd", "ps", "ip",
+    "ss", "ts", "go", ".go", "rs", "cs", "js",
+}
+
+_PHRASE_INDEX: dict[str, list[tuple[str, str, int]]] = defaultdict(list)  # multi-word / long keywords
+_TOKEN_INDEX:  dict[str, list[tuple[str, str, int]]] = defaultdict(list)  # short single-word keywords
+
+for _cat, _sub, _score, _kws in RULES:
+    for _kw in _kws:
+        if _kw in _AMBIGUOUS_TOKENS:
+            continue  # drop known noise tokens entirely
+        if " " in _kw or len(_kw) > 5:
+            _PHRASE_INDEX[_kw].append((_cat, _sub, _score))
+        else:
+            _TOKEN_INDEX[_kw].append((_cat, _sub, _score))
+
+# Combined index used by is_retrieval_query (doesn't need the split)
+_KEYWORD_INDEX = {**_PHRASE_INDEX, **_TOKEN_INDEX}
+
+# Pre-compile word-boundary patterns for short token matching.
+# Filenames use underscores and hyphens as separators, so we treat them as
+# non-alphanumeric boundaries alongside standard whitespace / punctuation.
+_TOKEN_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+def _token_re(token: str) -> re.Pattern:
+    if token not in _TOKEN_PATTERN_CACHE:
+        # A "word boundary" here means: not preceded/followed by a letter or digit.
+        # This correctly handles:
+        #   "nmap_tutorial"   → "nmap" matches (boundary = "_")
+        #   "phishing"        → "sh"   does NOT match (preceded by "i")
+        #   "aes_key"         → "aes"  matches (boundary = "_")
+        _TOKEN_PATTERN_CACHE[token] = re.compile(
+            r"(?<![a-zA-Z0-9])" + re.escape(token) + r"(?![a-zA-Z0-9])",
+            re.IGNORECASE,
+        )
+    return _TOKEN_PATTERN_CACHE[token]
 
 
 def infer_category(source: str) -> Tuple[str, str]:
+    """
+    Score every rule against *source* and return the (category, subcategory)
+    with the highest cumulative score.
+
+    Scoring:
+      - Multi-word / long phrases match as substrings and score 2× base.
+      - Short single-word tokens must match at a word boundary and score 1× base.
+      - Ties broken by subcategory string length (more specific sub wins).
+    """
     s = source.lower()
-    best = ("general", "none", 0)
-    for cat, sub, score, keywords in RULES:
-        if any(k in s for k in keywords):
-            if score > best[2]:
-                best = (cat, sub, score)
-    return best[0], best[1]
+    tally: dict[tuple[str, str], float] = defaultdict(float)
+
+    # Phrase matches (substring — already specific enough)
+    for keyword, entries in _PHRASE_INDEX.items():
+        if keyword in s:
+            for cat, sub, score in entries:
+                tally[(cat, sub)] += score * 2.0
+
+    # Token matches (whole-word only)
+    for keyword, entries in _TOKEN_INDEX.items():
+        if _token_re(keyword).search(s):
+            for cat, sub, score in entries:
+                tally[(cat, sub)] += score * 1.0
+
+    if not tally:
+        return "other", "other"
+
+    best_cat, best_sub = max(
+        tally,
+        key=lambda k: (tally[k], len(k[1])),
+    )
+    return best_cat, best_sub
 
 
 # ─────────────────────────────────────────────
@@ -129,50 +208,71 @@ def upsert_chunks(chunks: list[str], source: str, collection=None) -> int:
 # RETRIEVAL
 # ─────────────────────────────────────────────
 
-# ── Edit these freely to control when RAG is skipped ──
-RAG_MIN_LENGTH = 10  # skip RAG if query is shorter than this (chars)
+RAG_MIN_LENGTH = 10
 
 RAG_SKIP_PHRASES = {
     "hi", "hello", "hey", "yo", "sup", "howdy",
     "good morning", "good afternoon", "good evening",
     "how are you", "what's up", "whats up",
-    "thanks", "thank you", "ok", "okay", "bye", "goodbye","what is your name",
+    "thanks", "thank you", "ok", "okay", "bye", "goodbye", "what is your name",
 }
 
 
 def is_retrieval_query(query: str) -> bool:
+    """
+    Return True when the query is substantive enough to benefit from RAG.
+
+    Logic (in order):
+      1. Skip trivially short queries.
+      2. Skip known small-talk phrases.
+      3. Accept any query that scores above zero against the keyword index —
+         this replaces the old exact-word-match loop which missed most real
+         queries (e.g. "how do I use nmap?" never matched because "how" isn't
+         a keyword, so the loop exited before reaching "nmap").
+    """
     q = query.strip().lower()
+
     if len(q) < RAG_MIN_LENGTH:
         return False
+
     if q in RAG_SKIP_PHRASES:
         return False
-    return True
+
+    # Accept if any keyword from any rule appears anywhere in the query.
+    for keyword in _KEYWORD_INDEX:
+        if keyword in q:
+            return True
+
+    # Fallback: treat longer free-form questions as retrieval candidates even
+    # when no explicit keyword matches — they may still hit relevant chunks via
+    # semantic similarity.
+    return len(q.split()) >= 5
 
 
 def retrieve_context(
     query: str,
     top_k: int = config.TOP_K_RESULTS,
     min_score: float = config.MIN_RELEVANCE_SCORE,
-    collection=None,
 ):
     if not is_retrieval_query(query):
         return []
 
-    conn = get_chroma_collection()
-    cur = conn.cursor()
     embedder = get_embedder()
     qvec = embedder.encode(query).tolist()
+
+    conn = get_chroma_collection()
+    cur = conn.cursor()
 
     try:
         cur.execute(
             """
-            SELECT text, source, category,
-                   1 / (1 + (embedding <-> %s::vector)) AS score
+            SELECT id, text, source, category, subcategory, chunk_index,
+                   embedding <-> %s::vector AS distance
             FROM documents
             ORDER BY embedding <-> %s::vector
             LIMIT %s
             """,
-            (qvec, qvec, top_k * 5),
+            (qvec, qvec, top_k),
         )
         rows = cur.fetchall()
     except Exception:
@@ -180,17 +280,20 @@ def retrieve_context(
         raise
 
     hits = []
-    for text, source, category, score in rows:
-        if score < min_score:
-            continue
-        hits.append({
-            "text":     text,
-            "source":   source,
-            "score":    round(score, 4),
-            "category": category,
-        })
+    for row_id, text, source, category, subcategory, chunk_index, dist in rows:
+        score = 1 / (1 + dist)
+        if score >= min_score:
+            hits.append({
+                "id": row_id,
+                "text": text,
+                "source": source,
+                "score": round(score, 4),
+                "category": category,
+                "subcategory": subcategory,
+                "chunk_index": chunk_index,
+            })
 
-    return sorted(hits, key=lambda x: x["score"], reverse=True)[:top_k]
+    return hits
 
 
 # ─────────────────────────────────────────────
@@ -203,8 +306,12 @@ def format_context_block(rag_hits: list[dict]) -> str:
     blocks = []
     for hit in rag_hits:
         blocks.append(
-            f"[SOURCE: {hit.get('source','unknown')} | cat: {hit.get('category','unknown')} | "
-            f"chunk: {hit.get('chunk_index','?')} | id: {hit.get('id','?')}]\n{hit.get('text','')}"
+            f"[SOURCE: {hit.get('source', 'unknown')} | "
+            f"cat: {hit.get('category', 'unknown')}/{hit.get('subcategory', 'unknown')} | "
+            f"chunk: {hit.get('chunk_index', '?')} | "
+            f"id: {hit.get('id', '?')} | "
+            f"score: {hit.get('score', '?')}]\n"
+            f"{hit.get('text', '')}"
         )
     return "\n\n".join(blocks)
 
