@@ -3,8 +3,6 @@ main.py — Streaming CLI chat interface for the local AI assistant.
 Everything is lazy: DB connection and embedder only load on first query.
 """
 
-
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -42,22 +40,22 @@ import requests
 import config
 from config import configure_logging
 from rag import get_chroma_collection, retrieve_context, format_context_block, get_db_count
-########################
-#hacker 
 
+########################
+#hacker
 from hack import connection
-
-
-
 ########################
-
-
 
 configure_logging()
 logger = logging.getLogger(__name__)
 console = Console()
 
 Message = dict[str, str]
+
+# RAG modes
+RAG_MODE_TOOL   = "tool"    # model decides when to search (tool calling)
+RAG_MODE_INJECT = "inject"  # always retrieve + inject before sending
+RAG_MODE_OFF    = "off"     # no RAG at all
 
 
 # ──────────────────────────────────────────────
@@ -67,27 +65,34 @@ Message = dict[str, str]
 import importlib.util
 import inspect
 
-def load_addons(folder="addon"):
-    functions = {}
 
-    for root, _, files in os.walk(folder):
-        for file in files:
-            if not file.endswith(".py"):
-                continue
+class LazyAddons:
+    def __init__(self, folder="addons"):
+        self.paths = {}
+        self.cache = {}
 
-            path = os.path.join(root, file)
-            module_name = path.replace(os.sep, ".").removesuffix(".py")
+        for root, _, files in os.walk(folder):
+            for file in files:
+                if file.endswith(".py"):
+                    name = os.path.splitext(file)[0]
+                    self.paths[name] = os.path.join(root, file)
 
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+    def __contains__(self, name):
+        return name in self.paths
 
-            for name, obj in inspect.getmembers(module, inspect.isfunction):
-                functions[name] = obj
-                print(f"Loaded: {name}() from {path}")
+    def __getitem__(self, name):
+        if name in self.cache:
+            return self.cache[name]
 
-    return functions
-addons = load_addons("addons")
+        path = self.paths[name]
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        func = getattr(module, name)
+        self.cache[name] = func
+        return func
+
 
 class ConversationMemory:
     def __init__(self, max_pairs: int = config.MAX_HISTORY_PAIRS) -> None:
@@ -113,14 +118,177 @@ class ConversationMemory:
 
 
 # ──────────────────────────────────────────────
+# TOOL DEFINITIONS
+# ──────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": (
+                "Search the local knowledge base for relevant information. "
+                "Only call this when the user asks about a specific topic "
+                "that may be in your documents. Do NOT call for greetings, "
+                "casual chat, or questions you already know the answer to."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to look up in the knowledge base",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+
+def run_search_tool(query: str) -> str:
+    """Execute the search_docs tool and return formatted results as a string."""
+    if not isinstance(query, str):
+        query = str(query)
+    query = query.strip()
+    if not query:
+        return "No query provided."
+    try:
+        hits = retrieve_context(
+            query,
+            top_k=config.TOP_K_RESULTS,
+            min_score=config.MIN_RELEVANCE_SCORE,
+        )
+        if not hits:
+            return "No relevant information found in the knowledge base."
+
+        result = format_context_block(hits)
+        if not isinstance(result, str):
+            result = str(result)
+
+        sources = {h["source"].split("/")[-1] for h in hits}
+        console.print(
+            f"[dim]📎 Retrieved {len(hits)} chunk(s) from: {', '.join(sources)}[/]"
+        )
+        return result
+    except Exception as exc:
+        logger.error("Tool search failed: %s", exc)
+        return f"Search failed: {exc}"
+
+
+# ──────────────────────────────────────────────
 # STREAMING
 # ──────────────────────────────────────────────
 
-async def stream_response(
+async def stream_response_tool(
     client: AsyncClient,
     messages: list[Message],
     model: str,
 ) -> AsyncIterator[str]:
+    """Tool-calling mode: model decides when to search."""
+    response = await client.chat(
+        model=model,
+        messages=messages,
+        stream=False,
+        options=config.OLLAMA_OPTIONS,
+        tools=TOOLS,
+    )
+
+    msg = response.message
+
+    if msg.tool_calls:
+        tool_messages = list(messages)
+        tool_messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": msg.tool_calls,
+        })
+
+        for tool_call in msg.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args = tool_call.function.arguments or {}
+
+            if fn_name == "search_docs":
+                query = fn_args.get("query", "") if isinstance(fn_args, dict) else str(fn_args)
+                tool_result = await asyncio.to_thread(run_search_tool, query)
+            else:
+                tool_result = f"Unknown tool: {fn_name}"
+
+            tool_messages.append({"role": "tool", "content": tool_result})
+
+        async for chunk in await client.chat(
+            model=model,
+            messages=tool_messages,
+            stream=True,
+            options=config.OLLAMA_OPTIONS,
+        ):
+            token = chunk.message.content
+            if token:
+                yield token
+    else:
+        async for chunk in await client.chat(
+            model=model,
+            messages=messages,
+            stream=True,
+            options=config.OLLAMA_OPTIONS,
+        ):
+            token = chunk.message.content
+            if token:
+                yield token
+
+
+async def stream_response_inject(
+    client: AsyncClient,
+    messages: list[Message],
+    model: str,
+    raw_query: str,
+) -> AsyncIterator[str]:
+    """Inject mode: always retrieve and prepend context before sending."""
+    rag_hits: list[dict] = []
+    try:
+        rag_hits = await asyncio.to_thread(
+            retrieve_context,
+            raw_query,
+            top_k=config.TOP_K_RESULTS,
+            min_score=config.MIN_RELEVANCE_SCORE,
+        )
+        if rag_hits:
+            sources = {h["source"].split("/")[-1] for h in rag_hits}
+            console.print(
+                f"[dim]📎 Retrieved {len(rag_hits)} chunk(s) from: {', '.join(sources)}[/]"
+            )
+    except Exception as exc:
+        logger.error("RAG retrieval failed: %s", exc)
+
+    # Swap the last user message with the RAG-augmented version
+    context_block = format_context_block(rag_hits)
+    augmented_messages = list(messages)
+    if context_block and augmented_messages:
+        last = augmented_messages[-1]
+        if last["role"] == "user":
+            augmented_messages[-1] = {
+                "role": "user",
+                "content": f"{context_block}\n\nUser question: {last['content']}",
+            }
+
+    async for chunk in await client.chat(
+        model=model,
+        messages=augmented_messages,
+        stream=True,
+        options=config.OLLAMA_OPTIONS,
+    ):
+        token = chunk.message.content
+        if token:
+            yield token
+
+
+async def stream_response_off(
+    client: AsyncClient,
+    messages: list[Message],
+    model: str,
+) -> AsyncIterator[str]:
+    """No RAG — plain streaming."""
     async for chunk in await client.chat(
         model=model,
         messages=messages,
@@ -133,16 +301,24 @@ async def stream_response(
 
 
 # ──────────────────────────────────────────────
-# RAG MESSAGE BUILDER
+# TRIM MESSAGES
 # ──────────────────────────────────────────────
 
-def build_user_message(query: str, rag_hits: list[dict]) -> Message:
-    context_block = format_context_block(rag_hits)
-    if context_block:
-        content = f"{context_block}\n\nUser question: {query}"
-    else:
-        content = query
-    return {"role": "user", "content": content}
+def trim_messages(messages: list[dict], max_tokens: int = 4096) -> list[dict]:
+    """Keep system prompt + trim oldest exchanges to stay under token budget."""
+    system = [m for m in messages if m["role"] == "system"]
+    conversation = [m for m in messages if m["role"] != "system"]
+
+    def tokens(m):
+        return len(str(m.get("content", ""))) // 4
+
+    system_tokens = sum(tokens(m) for m in system)
+    budget = max_tokens - system_tokens
+
+    while conversation and sum(tokens(m) for m in conversation) > budget:
+        conversation = conversation[2:]
+
+    return system + conversation
 
 
 # ──────────────────────────────────────────────
@@ -157,6 +333,7 @@ COMMANDS = {
     "/docs":   "Show how many vectors are in the store",
     "/status": "Show current config / model",
     "/info":   "System information",
+    "/rag":    "Switch RAG mode  (/rag tool | /rag inject | /rag off)",
     "/exit":   "Quit the assistant",
 }
 
@@ -168,7 +345,7 @@ def handle_command(
 ) -> bool:
     parts = command.strip().split(maxsplit=1)
     cmd = parts[0].lower()
-    arg = parts[1] if len(parts) > 1 else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd == "/help":
         table = Table(title="Available Commands", show_header=True, header_style="bold red")
@@ -177,6 +354,22 @@ def handle_command(
         for c, desc in COMMANDS.items():
             table.add_row(c, desc)
         console.print(table)
+
+    elif cmd == "/rag":
+        valid = (RAG_MODE_TOOL, RAG_MODE_INJECT, RAG_MODE_OFF)
+        if arg not in valid:
+            console.print(
+                f"[yellow]Current RAG mode: [bold]{state['rag_mode']}[/]\n"
+                f"Usage: /rag tool | /rag inject | /rag off[/]"
+            )
+            return True
+        state["rag_mode"] = arg
+        descriptions = {
+            RAG_MODE_TOOL:   "model decides when to search (tool calling)",
+            RAG_MODE_INJECT: "always retrieve + inject context before every message",
+            RAG_MODE_OFF:    "no RAG — model uses only its own knowledge",
+        }
+        console.print(f"[green]✓ RAG mode → [bold]{arg}[/] — {descriptions[arg]}[/]")
 
     elif cmd == "/info":
         response = ollama.list()
@@ -190,6 +383,7 @@ def handle_command(
         table.add_column("Key", style="bold red")
         table.add_column("Value", style="red")
         table.add_row("Active model", state["model"])
+        table.add_row("RAG mode", state["rag_mode"])
         table.add_row("Available models", ", ".join(models) if models else "None")
         table.add_row("Ollama host", config.OLLAMA_HOST)
         table.add_row("Conversation pairs", f"{memory.pair_count}/{memory.max_pairs}")
@@ -208,7 +402,6 @@ def handle_command(
         if not arg:
             console.print(f"[yellow]Current model: [bold]{state['model']}[/][/]")
             return True
-        arg = arg.strip()
         if arg.isdigit():
             idx = int(arg) - 1
             if idx < 0 or idx >= len(models):
@@ -238,6 +431,7 @@ def handle_command(
         table.add_column("Key", style="bold")
         table.add_column("Value", style="cyan")
         table.add_row("Model", state["model"])
+        table.add_row("RAG mode", state["rag_mode"])
         table.add_row("Ollama host", config.OLLAMA_HOST)
         table.add_row("History pairs", f"{memory.pair_count} / {memory.max_pairs}")
         table.add_row("Top-K retrieval", str(config.TOP_K_RESULTS))
@@ -247,23 +441,29 @@ def handle_command(
     elif cmd in ("/exit", "/quit", "/bye"):
         console.print("\n[bold green]Goodbye! 👋[/]")
         return False
-    
+
     elif cmd.startswith("/"):
-        
-        finalcmd = cmd.replace("/","")
+        finalcmd = cmd.replace("/", "")
         argsplit = parts[1].split() if len(parts) > 1 else []
+        addons = LazyAddons("addons")
+        print(f"Looking for: {finalcmd}")
         if finalcmd in addons:
             try:
-                addons[finalcmd](*argsplit)
+                result = addons[finalcmd](*argsplit)
+                if isinstance(result, str):
+                    console.rule("[bold red]Addon output[/]")
+                    console.print(f"[white]{result}[/]")
+                    console.rule("[bold red][/]")
+                    console.print("[bold red]Would you like to send to ai?[bold yellow]Y[/]/[bold yellow]N[/][/]")
+                    userconfirm = input("\u200B")
+                    if userconfirm == "y":
+                        return result
+                    else:
+                        return
             except TypeError as e:
-                addons[finalcmd]
                 print(f"Argument error for '{finalcmd}': {e}    args:{argsplit}")
         else:
             console.print(f"[red]Unknown command '{cmd}'. Type /help for options.[/]")
-
-
-    else:
-        console.print(f"[red]Unknown command '{cmd}'. Type /help for options.[/]")
 
     return True
 
@@ -275,7 +475,10 @@ def handle_command(
 async def chat_loop() -> None:
     client = AsyncClient(host=config.OLLAMA_HOST)
     memory = ConversationMemory()
-    state = {"model": config.DEFAULT_MODEL}
+    state = {
+        "model": config.DEFAULT_MODEL,
+        "rag_mode": RAG_MODE_INJECT,  # default mode
+    }
 
     # ── fetch DB stats for banner ──
     try:
@@ -301,13 +504,15 @@ async def chat_loop() -> None:
         db_section = "\n[dim]  DB unavailable[/]\n"
 
     console.print(Panel(
+
         "[dim]──────────────────────────────────────────────────────────────────────────────[/]\n"
         f"[bold red]  Model   [/][white]{state['model']}[/]\n"
         f"[bold red]  Host    [/][white]{config.OLLAMA_HOST}[/]\n"
+        f"[bold red]  RAG     [/][white]{state['rag_mode']}[/]\n"
         "[dim]──────────────────────────────────────────────────────────────────────────────[/]"
         + db_section +
         "[red]──────────────────────────────────────────────────────────────────────────────[/]\n"
-        "  [white]/help[/] [red]·[/] [white]/model[/] [red]·[/] [white]/list[/] [red]·[/] [white]/docs[/] [red]·[/] [white]/info[/] [red]·[/] [white]/clear[/] [red]·[/] [white]/exit[/]",
+        "  [white]/help[/] [red]·[/] [white]/model[/] [red]·[/] [white]/list[/] [red]·[/] [white]/docs[/] [red]·[/] [white]/info[/] [red]·[/] [white]/clear[/] [red]·[/] [white]/rag[/] [red]·[/] [white]/exit[/]",
         border_style="bold red",
         padding=(1, 4),
         width=console.width,
@@ -324,52 +529,36 @@ async def chat_loop() -> None:
         raw = raw.strip()
         if not raw:
             continue
-
         if raw.startswith("/"):
-            should_continue = handle_command(raw, memory, state)
-            if not should_continue:
+            result = handle_command(raw, memory, state)
+            if result is False:
                 break
-            continue
+            if isinstance(result, str):
+                raw = result
+            else:
+                continue
 
-        # ── RAG retrieval ──
-        rag_hits: list[dict] = []
-        try:
-            rag_hits = retrieve_context(
-                raw,
-                top_k=config.TOP_K_RESULTS,
-                min_score=config.MIN_RELEVANCE_SCORE,
-            )
-            if rag_hits:
-                sources = {h["source"].split("/")[-1] for h in rag_hits}
-                console.print(
-                    f"[dim]📎 Retrieved {len(rag_hits)} chunk(s) from: "
-                    f"{', '.join(sources)}[/]"
-                )
-        except Exception as exc:
-            logger.error("RAG retrieval failed: %s", exc)
-
-        # ── Build messages ──
-        user_msg = build_user_message(raw, rag_hits)
-        messages_to_send = memory.get_messages(config.SYSTEM_PROMPT) + [user_msg]
+        # ── Build base messages ──
+        user_msg: Message = {"role": "user", "content": raw}
+        messages_to_send = trim_messages(memory.get_messages(config.SYSTEM_PROMPT) + [user_msg])
 
         console.print(Rule(style="bold red"))
 
-        # ── Thinking spinner until first token arrives ──
         full_response = ""
-        first_token = True
-
-        async def get_first_token():
-            async for token in stream_response(client, messages_to_send, state["model"]):
-                return token
-            return ""
+        mode = state["rag_mode"]
 
         try:
             with console.status("[red]thinking…[/]", spinner="dots", spinner_style="bold red"):
-                # collect first token so spinner shows until model starts responding
-                gen = stream_response(client, messages_to_send, state["model"])
+                if mode == RAG_MODE_TOOL:
+                    gen = stream_response_tool(client, messages_to_send, state["model"])
+                elif mode == RAG_MODE_INJECT:
+                    gen = stream_response_inject(client, messages_to_send, state["model"], raw)
+                else:  # off
+                    gen = stream_response_off(client, messages_to_send, state["model"])
+
                 first = await gen.__anext__()
 
-            console.print(Text("AI:", style="bold red"))
+            console.print(Text("Hungry:", style="bold red"))
 
             with Live(
                 Markdown(first + "▋"),
@@ -405,11 +594,7 @@ async def chat_loop() -> None:
             {"role": "user", "content": raw},
             {"role": "assistant", "content": full_response},
         )
-        logger.info(
-            "Exchange saved. Pairs: %d. RAG hits: %d.",
-            memory.pair_count,
-            len(rag_hits),
-        )
+        logger.info("Exchange saved. Pairs: %d. Mode: %s.", memory.pair_count, mode)
 
 
 def main() -> None:
