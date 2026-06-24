@@ -1,4 +1,12 @@
+"""
+ingest.py — Unified RAG ingestion pipeline (docs + web + crawl) — async edition
 
+python3 ingest.py --mode web --url https://github.com/louuuuuu/Hackopedia/tree/main/Web%20Hacking
+python3 ingest.py --mode web --url https://github.com/louuuuuu/Hackopedia --crawl --prefix https://github.com/louuuuuu/Hackopedia --max-pages 100
+python3 ingest.py --mode docs --path README.md
+
+pip install aiohttp
+"""
 
 from __future__ import annotations
 import re
@@ -58,7 +66,7 @@ _BOILERPLATE_PATTERNS = [
         r"^(home|about|contact|privacy|terms|cookies?|sign (in|up)|log (in|out)|register)",
         r"^(loading\.\.\.|please wait|javascript is required)",
         r"^(copyright|all rights reserved|©)",
-        r"^\s*[\|\/\\]\s*$",                      # lone separators
+        r"^\s*[\|\/\\]\s*$",
         r"^(tweet|share|like|follow|subscribe)",
         r"^(menu|sidebar|footer|header|navigation|breadcrumb)",
         r"^\d+\s*(views?|comments?|shares?|likes?)\s*$",
@@ -66,72 +74,133 @@ _BOILERPLATE_PATTERNS = [
     ]
 ]
 
-# Lines that are almost certainly gibberish
 _GIBBERISH_PATTERNS = [
     re.compile(p) for p in [
-        r"^[^a-zA-Z0-9\s]{5,}$",           # all symbols
-        r"(.)\1{6,}",                        # char repeated 7+ times
-        r"^[a-f0-9]{32,}$",                  # raw hashes
-        r"^\s*\[[\w\s]{0,12}\]\s*$",         # lone bracket-wrapped short labels
+        r"^[^a-zA-Z0-9\s]{5,}$",
+        r"(.)\1{6,}",
+        r"^[a-f0-9]{32,}$",
+        r"^\s*\[[\w\s]{0,12}\]\s*$",
     ]
 ]
 
 
-# ----------------------------
-# GIBBERISH / NOISE FILTER
-# ----------------------------
+# ─────────────────────────────────────────────
+# SOURCE SIGNAL BUILDER
+# ─────────────────────────────────────────────
+
+def build_source_signal(url_or_path: str, content: str = "") -> str:
+    """
+    Produce a clean, keyword-rich string that infer_category() can score
+    reliably, regardless of whether the input is a raw GitHub URL, a local
+    file path, or a generic web URL.
+
+    Strategy (applied in order):
+      1. Percent-decode the URL so %20 becomes a space, etc.
+      2. For GitHub blob/tree URLs strip the noisy user/repo/branch prefix and
+         keep only the meaningful path (folder + filename).
+      3. For local paths keep parent-directory name + filename.
+      4. Replace path separators and punctuation with spaces.
+      5. Extract the page/file title from the first heading or first line of
+         real content and append it — this gives the categoriser actual topic
+         words rather than just filename tokens.
+
+    The result is lowercased and returned.  It is passed to upsert_chunks()
+    as the ``source`` argument so that the DB record also carries readable
+    provenance.
+    """
+    raw = unquote(url_or_path)
+
+    if "github.com" in raw:
+        # Strip everything up to and including /blob/<branch>/ or /tree/<branch>/
+        m = re.search(r"/(?:blob|tree)/[^/]+/(.+)$", raw)
+        if m:
+            path_part = m.group(1)          # e.g. "Web Hacking/SQL Injection.md"
+        else:
+            parts = [p for p in urlparse(raw).path.split("/") if p]
+            path_part = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else raw)
+    else:
+        p = Path(raw)
+        if p.parent.name not in (".", ""):
+            path_part = f"{p.parent.name}/{p.name}"
+        else:
+            path_part = p.name
+
+    # Replace separators with spaces for keyword matching
+    signal = re.sub(r"[/_\-%.]+", " ", path_part).strip()
+
+    # Extract a content hint: first H1/H2 heading or first non-empty line
+    content_hint = _extract_title_hint(content)
+    if content_hint:
+        signal = f"{signal} {content_hint}"
+
+    return signal.lower()
+
+
+def _extract_title_hint(text: str, max_chars: int = 120) -> str:
+    """
+    Pull the first meaningful heading or sentence from extracted text.
+    We cap it so we don't overwhelm the keyword scorer with body prose.
+    """
+    if not text:
+        return ""
+
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        # Skip very short lines, pure-symbol lines, and lines that look like
+        # UI chrome (single words, navigation items, etc.)
+        if len(stripped) < 8:
+            continue
+        if not re.search(r"[a-zA-Z]{3,}", stripped):
+            continue
+        return stripped[:max_chars]
+
+    return ""
+
+
+# ─────────────────────────────────────────────
+# NOISE FILTER
+# ─────────────────────────────────────────────
 
 def _entropy(text: str) -> float:
-    """Shannon entropy of character distribution (bits per char)."""
     if not text:
         return 0.0
     counts = Counter(text)
     total = len(text)
     return -sum((c / total) * math.log2(c / total) for c in counts.values())
-def dedupe_chunks(chunks: list[str]) -> list[str]:
-    seen = set()
-    out = []
 
+
+def dedupe_chunks(chunks: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
     for c in chunks:
         norm = " ".join(c.lower().split())
-        if norm in seen:
-            continue
-        seen.add(norm)
-        out.append(c)
-
+        if norm not in seen:
+            seen.add(norm)
+            out.append(c)
     return out
 
 
 def is_bad_chunk(text: str) -> bool:
     words = text.split()
-
     if len(words) < 5:
         return True
-
     if len(set(words)) / max(len(words), 1) < 0.3:
         return True
-
     return False
+
 
 def _is_gibberish_line(line: str) -> bool:
     s = line.strip()
     if not s:
-        return False  # blank lines are fine — handled elsewhere
-
-    # Explicit pattern checks
+        return False
     for pat in _GIBBERISH_PATTERNS:
         if pat.search(s):
             return True
-
-    # Entropy check — very low entropy = highly repetitive garbage
     if len(s) > 20 and _entropy(s) < 1.5:
         return True
-
-    # Mostly non-printable / control characters
     non_print = sum(1 for c in s if unicodedata.category(c) in ("Cc", "Cf", "Cn"))
     if len(s) > 5 and non_print / len(s) > 0.25:
         return True
-
     return False
 
 
@@ -144,7 +213,6 @@ def _is_boilerplate_line(line: str) -> bool:
 
 
 def _word_ratio(text: str) -> float:
-    """Fraction of tokens that look like real words (contain ≥2 letters)."""
     tokens = text.split()
     if not tokens:
         return 0.0
@@ -153,43 +221,27 @@ def _word_ratio(text: str) -> float:
 
 
 def clean_extracted_text(raw: str) -> str:
-    """
-    Remove gibberish, boilerplate, and low-signal content from extracted text.
-    Returns cleaned text (may be empty string if nothing useful survived).
-    """
     if not raw:
         return ""
 
     lines = raw.splitlines()
-    kept = []
+    kept: list[str] = []
 
     for line in lines:
         stripped = line.strip()
-
-        # Always keep blank lines (paragraph structure)
         if not stripped:
             kept.append("")
             continue
-
-        # Drop boilerplate nav/UI text
         if _is_boilerplate_line(stripped):
             continue
-
-        # Drop gibberish characters / hashes / repetition
         if _is_gibberish_line(stripped):
             continue
-
-        # Drop very short lines that are almost certainly menu items / labels
         if len(stripped) < 4:
             continue
-
-        # Drop lines that are mostly non-word tokens (URLs, base64, minified JS, etc.)
         if len(stripped) > 40 and _word_ratio(stripped) < 0.35:
             continue
-
         kept.append(line)
 
-    # Collapse runs of 3+ blank lines into 2
     result_lines: list[str] = []
     blank_run = 0
     for line in kept:
@@ -203,16 +255,16 @@ def clean_extracted_text(raw: str) -> str:
 
     cleaned = "\n".join(result_lines).strip()
 
-    # Final quality gate: if <30% of the surviving text is real words, discard entirely
     if cleaned and _word_ratio(cleaned) < 0.30:
         return ""
 
     return cleaned
 
 
-# ----------------------------
-# DOC LOADERS  (sync — disk I/O, fast enough)
-# ----------------------------
+# ─────────────────────────────────────────────
+# DOC LOADERS
+# ─────────────────────────────────────────────
+
 def load_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -248,16 +300,15 @@ def collect_files(root: Path) -> list[Path]:
     return [p for p in root.rglob("*") if p.suffix.lower() in LOADER_MAP]
 
 
-# ----------------------------
+# ─────────────────────────────────────────────
 # GITHUB HELPERS
-# ----------------------------
+# ─────────────────────────────────────────────
 
 def is_github_blob(url: str) -> bool:
     return "github.com" in url and "/blob/" in url
 
 
 def is_github_tree(url: str) -> bool:
-    """GitHub directory listing page."""
     return "github.com" in url and "/tree/" in url
 
 
@@ -273,7 +324,6 @@ def is_github_junk(url: str) -> bool:
 
 
 def to_github_raw(url: str) -> str:
-    """Convert a github.com/blob/ URL to raw.githubusercontent.com."""
     parts = url.split("github.com/")[1].split("/")
     user, repo = parts[0], parts[1]
     branch_i = parts.index("blob") + 1
@@ -283,57 +333,41 @@ def to_github_raw(url: str) -> str:
 
 
 def extract_github_links(html: str, base_url: str, allowed_prefix: str) -> list[str]:
-    """
-    Extract links from a GitHub page, expanding tree/ (folder) links into
-    their contained blob/ (file) links so that sub-directories are traversed.
-    """
     soup = BeautifulSoup(html, "html.parser")
     found: set[str] = set()
-
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if not href or href.startswith("#"):
             continue
         full = urljoin(base_url, href).split("#")[0]
-
         if not full.startswith(allowed_prefix):
             continue
         if full == base_url:
             continue
         if is_github_junk(full):
             continue
-
         parsed = urlparse(full)
         path = parsed.path
-
-        # Accept directory listings (tree) and file blobs
         if "/tree/" in path or "/blob/" in path:
             found.add(full)
-
     return list(found)
 
 
 def extract_github_file_links(html: str, base_url: str) -> list[str]:
-    """
-    Given the HTML of a github.com/tree/ page, return all blob/ file URLs
-    listed inside that folder (not sub-folders, those are picked up via the
-    normal crawl loop).
-    """
     soup = BeautifulSoup(html, "html.parser")
     found: set[str] = set()
-
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if "/blob/" in href:
             full = urljoin("https://github.com", href).split("#")[0]
             found.add(full)
-
     return list(found)
 
 
-# ----------------------------
-# TEXT EXTRACTORS  (CPU-bound, kept sync)
-# ----------------------------
+# ─────────────────────────────────────────────
+# TEXT EXTRACTORS
+# ─────────────────────────────────────────────
+
 def extract_trafilatura(html: str) -> str | None:
     return trafilatura.extract(html)
 
@@ -351,14 +385,12 @@ def extract_bs4(html: str) -> str:
     main = soup.find("article") or soup.find("main") or soup.body
     if not main:
         return ""
-    lines = list(main.stripped_strings)
-    return "\n".join(lines)
+    return "\n".join(main.stripped_strings)
 
 
 def extract_links(html: str, base_url: str, allowed_prefix: str) -> list[str]:
-    """Generic link extractor for non-GitHub pages."""
     soup = BeautifulSoup(html, "html.parser")
-    found = set()
+    found: set[str] = set()
     for tag in soup.find_all("a", href=True):
         full = urljoin(base_url, tag["href"].strip()).split("#")[0]
         if full.startswith(allowed_prefix) and full != base_url and not is_github_junk(full):
@@ -367,7 +399,6 @@ def extract_links(html: str, base_url: str, allowed_prefix: str) -> list[str]:
 
 
 def parse_html(html: str, url: str, content_type: str) -> str:
-    """Pick best text extractor for a fetched page, then clean the result."""
     if "text/plain" in content_type or url.endswith(".md"):
         raw = html
     else:
@@ -379,13 +410,13 @@ def parse_html(html: str, url: str, content_type: str) -> str:
                 raw = None
         if not raw or len(raw) < 200:
             raw = extract_bs4(html)
-
     return clean_extracted_text(raw or "")
 
 
-# ----------------------------
+# ─────────────────────────────────────────────
 # ASYNC FETCH
-# ----------------------------
+# ─────────────────────────────────────────────
+
 async def fetch(
     session: aiohttp.ClientSession,
     url: str,
@@ -393,12 +424,7 @@ async def fetch(
     semaphore: asyncio.Semaphore,
     delay: float = 0.5,
 ) -> tuple[str, str, str]:
-    """
-    Returns (url, html, content_type).
-    Raises RuntimeError on failure.
-    """
     fetch_url = to_github_raw(url) if is_github_blob(url) else url
-
     async with semaphore:
         await asyncio.sleep(delay)
         try:
@@ -411,9 +437,10 @@ async def fetch(
             raise RuntimeError(f"Fetch failed: {e}")
 
 
-# ----------------------------
-# ASYNC CRAWLER  (GitHub-aware)
-# ----------------------------
+# ─────────────────────────────────────────────
+# ASYNC CRAWLER
+# ─────────────────────────────────────────────
+
 async def crawl_urls_async(
     seed_urls: list[str],
     *,
@@ -422,10 +449,6 @@ async def crawl_urls_async(
     concurrency: int = 8,
     delay: float = 0.5,
 ) -> list[str]:
-    """
-    Async BFS crawl. GitHub-aware: follows tree/ pages to discover blob/ files
-    inside sub-directories. Returns all discovered content URLs.
-    """
     if allowed_prefix is None:
         parsed = urlparse(seed_urls[0])
         allowed_prefix = f"{parsed.scheme}://{parsed.netloc}"
@@ -439,16 +462,14 @@ async def crawl_urls_async(
 
     visited: set[str] = set()
     queue: list[str] = [u for u in seed_urls if not is_github_junk(u)]
-    # URLs we actually want to ingest (blob files, or non-GitHub pages)
     content_urls: set[str] = set()
 
     semaphore = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-
-        while queue and len(visited) < max_pages * 3:  # visit more to find files
-            batch = []
+        while queue and len(visited) < max_pages * 3:
+            batch: list[str] = []
             while queue and len(batch) < concurrency:
                 url = queue.pop(0)
                 if url not in visited:
@@ -470,27 +491,22 @@ async def crawl_urls_async(
 
                 if is_github:
                     if is_github_blob(url):
-                        # This is an actual file — queue it for ingestion
                         content_urls.add(url)
                     elif is_github_tree(url) and "text/html" in content_type:
-                        # Directory page — extract all child links (files + sub-dirs)
                         new_links = extract_github_links(html, url, allowed_prefix)
                         for link in new_links:
                             if link not in visited:
                                 queue.append(link)
-                        # Also directly grab file links listed on this tree page
                         file_links = extract_github_file_links(html, url)
                         for fl in file_links:
                             if fl not in visited and fl.startswith(allowed_prefix):
                                 content_urls.add(fl)
                     elif "text/html" in content_type:
-                        # Root or other GitHub HTML page — extract links
                         new_links = extract_github_links(html, url, allowed_prefix)
                         for link in new_links:
                             if link not in visited:
                                 queue.append(link)
                 else:
-                    # Non-GitHub: ingest everything we fetch
                     content_urls.add(url)
                     if "text/html" in content_type:
                         new_links = extract_links(html, url, allowed_prefix)
@@ -507,9 +523,10 @@ async def crawl_urls_async(
     return result_urls
 
 
-# ----------------------------
+# ─────────────────────────────────────────────
 # ASYNC WEB PAGE LOADER
-# ----------------------------
+# ─────────────────────────────────────────────
+
 async def load_web_page_async(
     session: aiohttp.ClientSession,
     url: str,
@@ -520,15 +537,17 @@ async def load_web_page_async(
     return parse_html(html, url_result, content_type)
 
 
-# ----------------------------
-# CHROMA
-# ----------------------------
+# ─────────────────────────────────────────────
+# DB HANDLE
+# ─────────────────────────────────────────────
+
 col = get_chroma_collection()
 
 
-# ----------------------------
-# INGEST DOCS  (sync — disk I/O is fast)
-# ----------------------------
+# ─────────────────────────────────────────────
+# INGEST DOCS
+# ─────────────────────────────────────────────
+
 def ingest_docs(path: Path):
     files = collect_files(path)
     if not files:
@@ -537,7 +556,7 @@ def ingest_docs(path: Path):
 
     total_chunks = 0
     skipped = 0
-    scraped_data = []
+    scraped_data: list[str] = []
 
     with Progress(
         SpinnerColumn(),
@@ -565,7 +584,12 @@ def ingest_docs(path: Path):
             chunks = chunk_text(text)
             chunks = dedupe_chunks(chunks)
             chunks = [c for c in chunks if not is_bad_chunk(c)]
-            n = upsert_chunks(chunks, source=str(f), collection=col)
+
+            # Build a signal that combines the file path with a content hint
+            # so categorisation uses topic words, not just the filename.
+            source_signal = build_source_signal(str(f), text)
+
+            n = upsert_chunks(chunks, source=source_signal, collection=col)
             total_chunks += n
             scraped_data.append(f"[DOC] {f.name}\n{text}\n")
             progress.advance(task)
@@ -573,9 +597,10 @@ def ingest_docs(path: Path):
     return len(files), total_chunks, skipped, scraped_data
 
 
-# ----------------------------
-# INGEST WEB  (async)
-# ----------------------------
+# ─────────────────────────────────────────────
+# INGEST WEB
+# ─────────────────────────────────────────────
+
 async def ingest_web_async(
     urls: list[str],
     *,
@@ -586,7 +611,7 @@ async def ingest_web_async(
     delay: float = 0.5,
 ):
     total_chunks = 0
-    scraped_data = []
+    scraped_data: list[str] = []
 
     if crawl:
         console.print("[bold red]Crawl mode enabled — discovering links...[/]")
@@ -629,7 +654,6 @@ async def ingest_web_async(
                     progress.advance(task)
                     return
 
-                # Minimum content threshold — skip stub pages
                 word_count = len(text.split())
                 if word_count < 30:
                     console.print(f"[dim]⚠ Skipped (too short, {word_count}w): {url[:80]}[/]")
@@ -640,7 +664,14 @@ async def ingest_web_async(
                 chunks = chunk_text(text)
                 chunks = dedupe_chunks(chunks)
                 chunks = [c for c in chunks if not is_bad_chunk(c)]
-                n = upsert_chunks(chunks, source=url, collection=col)
+
+                # Build a signal that combines the decoded URL path with the
+                # page's own title/heading — this is the key fix: raw GitHub
+                # URLs like /louuuuuu/Hackopedia/blob/main/... contain no
+                # useful topic words, but the decoded path + first heading do.
+                source_signal = build_source_signal(url, text)
+
+                n = upsert_chunks(chunks, source=source_signal, collection=col)
                 total_chunks += n
                 scraped_data.append(f"[WEB] {url}\n{text}\n")
                 progress.advance(task)
@@ -654,7 +685,7 @@ async def ingest_web_async(
 
 
 def ingest_web(urls, *, crawl=False, allowed_prefix=None, max_pages=50, concurrency=8, delay=0.5):
-    """Sync wrapper — entry point from main()."""
+    """Sync entry point."""
     return asyncio.run(
         ingest_web_async(
             urls,
@@ -665,8 +696,6 @@ def ingest_web(urls, *, crawl=False, allowed_prefix=None, max_pages=50, concurre
             delay=delay,
         )
     )
-
-
 # ----------------------------
 # CLI
 # ----------------------------
