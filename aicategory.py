@@ -2,10 +2,12 @@ import requests
 import json
 import re
 
-with open("extraconfig.json", "r") as f:
-    data = json.load(f)
-
-currentmodel = "phi3:mini"
+try:
+    currentmodel = "phi3:mini"
+except:
+    with open("extraconfig.json", "r") as f:
+        data = json.load(f)
+        currentmodel = data["model"]
 
 def clean_value(text):
     text = re.sub(r"^(category|subcategory)\s*[:\-]\s*", "", text.strip(), flags=re.IGNORECASE)
