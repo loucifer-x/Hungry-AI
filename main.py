@@ -13,6 +13,7 @@ import os
 import warnings
 from collections import deque
 from typing import AsyncIterator
+import json
 
 # ── Suppress PyTorch / HuggingFace noise before any imports ──
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -65,7 +66,18 @@ RAG_MODE_OFF    = "off"     # no RAG at all
 import importlib.util
 import inspect
 
+def chagemodeljson(modelchange):
+    # Read the JSON file
+    with open("extraconfig.json", "r") as f:
+        data = json.load(f)
 
+    # Change the model value
+    data["model"] = modelchange
+
+    # Write back to the SAME file
+    with open("extraconfig.json", "w") as f:
+        json.dump(data, f, indent=4)
+chagemodeljson(config.DEFAULT_MODEL)
 class LazyAddons:
     def __init__(self, folder="addons"):
         self.paths = {}
@@ -363,7 +375,6 @@ def handle_command(
     parts = command.strip().split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
-
     if cmd == "/help":
         table = Table(title="Available Commands", show_header=True, header_style="bold red")
         table.add_column("Command", style="red")
@@ -437,10 +448,14 @@ def handle_command(
             if idx < 0 or idx >= len(models):
                 console.print("[red]Invalid model number[/]")
                 return True
+            
             state["model"] = models[idx]
+            
         else:
             state["model"] = arg
+            
         console.print(f"[green]✓ Model switched to [bold]{state['model']}[/][/]")
+        chagemodeljson(state["model"])
 
     elif cmd == "/list":
         response = ollama.list()
@@ -536,6 +551,7 @@ async def chat_loop() -> None:
         db_section = "\n[dim]  DB unavailable[/]\n"
 
     console.print(Panel(
+
         "[dim]──────────────────────────────────────────────────────────────────────────────[/]\n"
         f"[bold red]  Model   [/][white]{state['model']}[/]\n"
         f"[bold red]  Host    [/][white]{config.OLLAMA_HOST}[/]\n"
