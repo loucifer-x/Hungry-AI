@@ -4,7 +4,7 @@ A privacy-first, fully local AI assistant with RAG (Retrieval-Augmented Generati
 
 <img src="main.png" width="1000" alt="Ergo demo" /> 
 
-<img src="ingest.png" width="500" alt="Ergo demo" />
+<img src="ingest.png" width="100" alt="Ergo demo" />
 
 ---
 
