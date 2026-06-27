@@ -208,6 +208,4 @@ ergo/
 
 ---
 
-## License
 
-MIT
