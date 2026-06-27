@@ -2,7 +2,7 @@
 
 A privacy-first, fully local AI assistant with RAG (Retrieval-Augmented Generation), web search fallback, and a streaming CLI interface. Ergo runs entirely on your machine using [Ollama](https://ollama.com/) for LLM inference, PostgreSQL + pgvector for vector storage, and sentence-transformers for embeddings.
 
-<img src="main.png" width="700" alt="Ergo demo" />
+<img src="main.png" width="500" alt="Ergo demo" /> <img src="ingest.png" width="500" alt="Ergo demo" />
 
 ---
 
