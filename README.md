@@ -14,7 +14,7 @@ A privacy-first, fully local AI assistant with RAG (Retrieval-Augmented Generati
 - **Streaming CLI** — live token-by-token output rendered with Rich markdown
 - **Three RAG modes** — tool-calling (model decides when to search), inject (always retrieves), or off
 - **Web search fallback** — queries DuckDuckGo, Bing, and Mojeek in parallel when local knowledge is thin
-- **Auto-categorisation** — keyword rules + LLM fallback classify ingested content into 20+ categories (redteam, tools, linux, ai, cloud, etc.)
+- **Auto-categorisation** — keyword rules + LLM fallback classify ingested content categorieS
 - **Conversation memory** — configurable sliding window of message pairs
 - **Addon system** — drop Python files into `addons/` and call them as slash commands
 - **Ingestion pipeline** — ingest local docs (`.md`, `.txt`, `.pdf`) or crawl websites, including GitHub repos
